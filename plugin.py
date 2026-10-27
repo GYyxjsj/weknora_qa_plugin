@@ -123,7 +123,7 @@ class WeKnoraQaPlugin(MaiBotPlugin):
         # 同一个聊天流复用同一个 WeKnora 会话，问答才有上下文。
         self._stream_sessions: dict[str, str] = {}
         self._agent_ids: dict[str, str] = {}
-        self._model_ids: dict[str, str] = {}
+        self._model_ids: dict[str, tuple[str, str]] = {}
 
     # ---------------------------------------------------------------- #
     # 生命周期
@@ -296,22 +296,28 @@ class WeKnoraQaPlugin(MaiBotPlugin):
         """解析问答模型：配置指定优先，否则用 MaiBot planner 模型。返回 (模型 ID, 思考强度)。"""
 
         configured = self.config.model.model.strip()
-        models = await client.list_models()
-
         if configured:
+            cached = self._model_ids.get(configured)
+            if cached:
+                return cached
+            models = await client.list_models()
             model = self._match_model(models, configured)
             if model is None:
                 raise WeKnoraError(f"WeKnora 中没有名为「{configured}」的模型，可用模型：{describe_models(models)}")
-        else:
-            planner = await asyncio.to_thread(resolve_planner_model)
-            model = self._match_model(models, planner.identifier)
-            if model is None:
-                raise WeKnoraError(
-                    f"MaiBot planner 模型「{planner.name}」（{planner.identifier}）在 WeKnora 中不存在，"
-                    f"可用模型：{describe_models(models)}"
-                )
-            self.ctx.logger.info("使用 MaiBot planner 模型：%s（%s）", planner.name, planner.identifier)
+            resolved = (str(model.get("id") or ""), self._resolve_reasoning_effort(model))
+            self._model_ids[configured] = resolved
+            return resolved
 
+        # 跟随主程序 planner：主程序换了模型，这里下次提问就用新的。
+        models = await client.list_models()
+        planner = await asyncio.to_thread(resolve_planner_model)
+        model = self._match_model(models, planner.identifier)
+        if model is None:
+            raise WeKnoraError(
+                f"MaiBot planner 模型「{planner.name}」（{planner.identifier}）在 WeKnora 中不存在，"
+                f"可用模型：{describe_models(models)}"
+            )
+        self.ctx.logger.info("使用 MaiBot planner 模型：%s（%s）", planner.name, planner.identifier)
         return str(model.get("id") or ""), self._resolve_reasoning_effort(model)
 
     @staticmethod
