@@ -1,0 +1,42 @@
+{
+  "manifest_version": 2,
+  "version": "1.0.0",
+  "name": "WeKnora 知识库问答",
+  "description": "把麦麦的问题转发到自建 WeKnora 知识库：规划器可调用 weknora_ask 工具，用户也可直接发 /提问",
+  "author": {
+    "name": "local",
+    "url": "https://github.com/Tencent/WeKnora"
+  },
+  "license": "AGPL-3.0-or-later",
+  "urls": {
+    "repository": "https://github.com/Tencent/WeKnora",
+    "homepage": "https://github.com/Tencent/WeKnora",
+    "issues": "https://github.com/Tencent/WeKnora/issues"
+  },
+  "changelog": "CHANGELOG.md",
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "1.3.99"
+  },
+  "sdk": {
+    "min_version": "2.7.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "database"
+    }
+  },
+  "capabilities": [
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "local.weknora-qa-plugin"
+}
