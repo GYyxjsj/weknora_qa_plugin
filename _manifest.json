@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "1.0.0",
-  "name": "WeKnora 知识库问答",
-  "description": "把麦麦的问题转发到自建 WeKnora 知识库：规划器可调用 weknora_ask 工具，用户也可直接发 /提问",
+  "version": "1.1.0",
+  "name": "WeKnora 知识库检索",
+  "description": "从自建 WeKnora 知识库拉回原文片段，交给麦麦自己思考：规划器可调用 weknora_search 工具，用户也可直接发 /提问",
   "author": {
     "name": "local",
     "url": "https://github.com/Tencent/WeKnora"
@@ -30,7 +30,8 @@
     }
   },
   "capabilities": [
-    "send.text"
+    "send.text",
+    "llm.generate"
   ],
   "i18n": {
     "default_locale": "zh-CN",

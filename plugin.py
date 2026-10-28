@@ -1,9 +1,10 @@
-"""WeKnora 知识库问答插件。
+"""WeKnora 知识库检索插件。
 
-给麦麦一条通往自建 WeKnora 知识库的路：规划器可以调用 ``weknora_ask`` 工具，
-用户也可以直接发 ``/提问 <问题>``。问答在 WeKnora 侧完成，模型默认用 MaiBot 自身
-planner 任务所选模型的无思考版本——解析主程序 ``config/model_config.toml`` 拿到
-planner 的 model_identifier，在 WeKnora 里按同名模型下发，并强制关闭思考。
+不让 WeKnora 生成答案：插件只调 ``POST /api/v1/knowledge-search``，用知识库建库时
+绑定的向量模型（与 MaiBot ``embedding`` 任务配的是同一个）把原文片段拉回来，交给
+麦麦自己的规划器思考作答。对外只有两个入口——规划器可调用的 ``weknora_search``
+工具，和用户手敲的 ``/提问``；``/提问`` 也是先检索片段，再让 MaiBot 的 planner
+模型根据片段组织答案。
 """
 
 from __future__ import annotations
@@ -17,10 +18,10 @@ import uuid
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
-from .planner_model import PlannerModelError, describe_models, resolve_planner_model
-from .weknora_client import AskOptions, WeKnoraClient, WeKnoraError
+from .embedding_model import EmbeddingModel, EmbeddingModelError, resolve_embedding_model
+from .weknora_client import KnowledgeChunk, SearchOptions, WeKnoraClient, WeKnoraError
 
-_DEFAULT_SESSION_KEY = "__default__"
+_TOOL_NAME = "weknora_search"
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -31,7 +32,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件", json_schema_extra={"label": "启用"})
-    config_version: str = Field(default="1.0.0", description="配置版本", json_schema_extra={"label": "配置版本"})
+    config_version: str = Field(default="1.1.0", description="配置版本", json_schema_extra={"label": "配置版本"})
 
 
 class ServiceConfig(PluginConfigBase):
@@ -48,39 +49,42 @@ class ServiceConfig(PluginConfigBase):
     )
     api_key: str = Field(
         default="",
-        description="WeKnora API Key（请求头 X-API-Key），智能体问答需要 full_access 权限的密钥",
+        description="WeKnora API Key（请求头 X-API-Key），检索需要能访问目标知识库的密钥",
         json_schema_extra={"label": "API Key"},
     )
-    agent: str = Field(
-        default="",
-        description="智能体 ID 或名称；留空则使用 WeKnora 内置的快速问答",
-        json_schema_extra={"label": "智能体"},
-    )
     timeout_seconds: int = Field(
-        default=180,
-        ge=10,
-        le=1800,
-        description="单次问答超时（秒）",
+        default=60,
+        ge=5,
+        le=600,
+        description="单次检索超时（秒）",
         json_schema_extra={"label": "超时（秒）"},
     )
 
 
-class ModelConfig(PluginConfigBase):
-    """问答所用模型配置。"""
+class RetrievalConfig(PluginConfigBase):
+    """检索参数配置。"""
 
-    __ui_label__ = "模型"
-    __ui_icon__ = "brain"
+    __ui_label__ = "检索"
+    __ui_icon__ = "search"
     __ui_order__ = 2
 
-    model: str = Field(
+    knowledge_base: str = Field(
         default="",
-        description="WeKnora 模型名称或 ID；留空则自动使用 MaiBot planner 模型",
-        json_schema_extra={"label": "模型"},
+        description="知识库名称或 ID；留空则检索租户下的全部知识库",
+        json_schema_extra={"label": "知识库"},
     )
-    reasoning_effort: str = Field(
-        default="off",
-        description="思考强度：off=无思考，auto=自动，其余为具体档位",
-        json_schema_extra={"label": "思考强度"},
+    match_count: int = Field(
+        default=3,
+        ge=1,
+        le=200,
+        description="取回的片段数量，越多上下文越长",
+        json_schema_extra={"label": "片段数量"},
+    )
+    max_chars_per_chunk: int = Field(
+        default=2000,
+        ge=0,
+        description="单条片段最多注入多少字符，0 表示不截断",
+        json_schema_extra={"label": "片段截断长度"},
     )
 
 
@@ -93,37 +97,30 @@ class PromptConfig(PluginConfigBase):
 
     bot_prompt: str = Field(
         default="",
-        description="注入麦麦规划器上下文的提示词，留空则不注入",
+        description="注入麦麦规划器上下文的提示词，说明什么时候该检索知识库；留空则不注入",
         json_schema_extra={"label": "Bot 提示词"},
-    )
-    agent_prompt: str = Field(
-        default="",
-        description="拼在问题前面发给 WeKnora 智能体的前置提示词",
-        json_schema_extra={"label": "智能体提示词"},
     )
 
 
 class WeKnoraQaConfig(PluginConfigBase):
-    """WeKnora 问答插件配置。"""
+    """WeKnora 知识库检索插件配置。"""
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)
-    model: ModelConfig = Field(default_factory=ModelConfig)
+    retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     prompt: PromptConfig = Field(default_factory=PromptConfig)
 
 
 class WeKnoraQaPlugin(MaiBotPlugin):
-    """WeKnora 知识库问答插件。"""
+    """WeKnora 知识库检索插件。"""
 
     config_model = WeKnoraQaConfig
 
     def __init__(self) -> None:
         super().__init__()
         self._client: WeKnoraClient | None = None
-        # 同一个聊天流复用同一个 WeKnora 会话，问答才有上下文。
-        self._stream_sessions: dict[str, str] = {}
-        self._agent_ids: dict[str, str] = {}
-        self._model_ids: dict[str, tuple[str, str]] = {}
+        # 向量模型核对只做一次：核对结果只取决于两边的模型配置，与单次检索无关。
+        self._embedding_checked = False
 
     # ---------------------------------------------------------------- #
     # 生命周期
@@ -131,28 +128,27 @@ class WeKnoraQaPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._client = self._build_client()
+        retrieval = self.config.retrieval
         self.ctx.logger.info(
-            "WeKnora 问答插件已加载：url=%s，agent=%s",
+            "WeKnora 检索插件已加载：url=%s，知识库=%s，片段数=%d",
             self.config.service.url,
-            self.config.service.agent or "自动",
+            retrieval.knowledge_base or "全部",
+            retrieval.match_count,
         )
 
     async def on_unload(self) -> None:
         self._client = None
-        self._stream_sessions.clear()
-        self.ctx.logger.info("WeKnora 问答插件已卸载")
+        self.ctx.logger.info("WeKnora 检索插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
-        """配置热更新：重建客户端并清空缓存，让新参数立即生效。"""
+        """配置热更新：重建客户端，让新参数立即生效。"""
 
         del config_data
         if scope != "self":
             self.ctx.logger.debug("忽略非插件自身配置更新：scope=%s version=%s", scope, version)
             return
         self._client = self._build_client()
-        self._stream_sessions.clear()
-        self._agent_ids.clear()
-        self._model_ids.clear()
+        self._embedding_checked = False
         self.ctx.logger.info("配置已热更新（版本 %s），已重建客户端", version)
 
     # ---------------------------------------------------------------- #
@@ -160,7 +156,7 @@ class WeKnoraQaPlugin(MaiBotPlugin):
     # ---------------------------------------------------------------- #
 
     def get_components(self) -> list[dict[str, Any]]:
-        """给问答工具放宽 RPC 超时：一次 RAG 问答经常超过默认的 60 秒。"""
+        """给检索工具放宽 RPC 超时：向量召回加 rerank 可能超过默认的 60 秒。"""
 
         components = super().get_components()
         try:
@@ -169,55 +165,72 @@ class WeKnoraQaPlugin(MaiBotPlugin):
             return components
         for component in components:
             metadata = component.get("metadata")
-            if component.get("name") == "weknora_ask" and isinstance(metadata, dict):
+            if component.get("name") == _TOOL_NAME and isinstance(metadata, dict):
                 metadata["timeout_ms"] = timeout_ms
         return components
 
     @Tool(
-        "weknora_ask",
-        description="向 WeKnora 知识库智能体提问并取回答案。遇到需要查证的设定、剧情、关卡、机制、术语等问题时使用。",
+        _TOOL_NAME,
+        description=(
+            "从 WeKnora 知识库检索原文片段，返回若干条最相关的段落，不做任何总结。"
+            "需要查证游戏设定、角色、符卡、帧数、机制、术语等事实性问题时使用；"
+            "拿到片段后由你自己组织答案，片段里没有的内容就如实说明。"
+        ),
         parameters=[
             ToolParameterInfo(
                 name="query",
                 param_type=ToolParamType.STRING,
-                description="要查询的问题，写成完整问句",
+                description="检索用的查询语句，写清关键实体与术语",
                 required=True,
             ),
         ],
     )
-    async def handle_weknora_ask(self, query: str = "", stream_id: str = "", **kwargs: Any) -> dict[str, str]:
-        """把问题转给 WeKnora 智能体，把答案交回规划器。"""
+    async def handle_weknora_search(self, query: str = "", **kwargs: Any) -> dict[str, str]:
+        """把知识库原文片段交回规划器，由规划器自己思考作答。"""
 
         del kwargs
         question = (query or "").strip()
         if not question:
-            return {"name": "weknora_ask", "content": "问题为空，无法查询知识库。"}
+            return {"name": _TOOL_NAME, "content": "查询为空，无法检索知识库。"}
         try:
-            answer = await self._ask(question, stream_id)
-        except (WeKnoraError, PlannerModelError) as exc:
-            self.ctx.logger.error("知识库问答失败：%s", exc)
-            return {"name": "weknora_ask", "content": f"知识库问答失败：{exc}"}
-        return {"name": "weknora_ask", "content": answer}
+            chunks = await self._retrieve(question)
+        except WeKnoraError as exc:
+            self.ctx.logger.error("知识库检索失败：%s", exc)
+            return {"name": _TOOL_NAME, "content": f"知识库检索失败：{exc}"}
+        return {"name": _TOOL_NAME, "content": self._format_chunks(question, chunks)}
 
-    @Command("提问", description="向 WeKnora 知识库提问", pattern=r"^/提问\s*(?P<query>.+)$")
+    @Command("提问", description="检索 WeKnora 知识库并让麦麦作答", pattern=r"^/提问\s*(?P<query>.+)$")
     async def handle_ask_command(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
-        """用户直接提问，答案直接发回聊天。"""
+        """用户直接提问：检索片段，交给 MaiBot 的 planner 模型作答后发回聊天。"""
 
         question = self._extract_query(kwargs)
         if not question:
             return False, "用法：/提问 <你的问题>", True
         try:
-            answer = await self._ask(question, stream_id)
-        except (WeKnoraError, PlannerModelError) as exc:
-            self.ctx.logger.error("知识库问答失败：%s", exc)
-            await self.ctx.send.text(f"知识库问答失败：{exc}", stream_id)
-            return False, f"知识库问答失败：{exc}", True
+            chunks = await self._retrieve(question)
+        except WeKnoraError as exc:
+            self.ctx.logger.error("知识库检索失败：%s", exc)
+            await self.ctx.send.text(f"知识库检索失败：{exc}", stream_id)
+            return False, f"知识库检索失败：{exc}", True
+        if not chunks:
+            await self.ctx.send.text(f"知识库里没有检索到与「{question}」相关的资料。", stream_id)
+            return True, "知识库无命中", True
+
+        fragments = self._format_chunks(question, chunks)
+        result = await self.ctx.llm.generate(self._build_answer_prompt(question, fragments), task_name="planner")
+        answer = str(result.get("response") or "").strip()
+        if not result.get("success") or not answer:
+            reason = str(result.get("error") or "").strip() or "模型没有返回内容"
+            self.ctx.logger.error("知识库作答失败：%s", reason)
+            await self.ctx.send.text(f"检索到 {len(chunks)} 条片段，但作答失败：{reason}", stream_id)
+            return False, f"知识库作答失败：{reason}", True
+
         await self.ctx.send.text(answer, stream_id)
-        return True, "已向知识库提问并回复", True
+        return True, "已检索知识库并回复", True
 
     @HookHandler("maisaka.planner.before_request", name="weknora_bot_prompt", mode=HookMode.BLOCKING)
     async def inject_bot_prompt(self, **kwargs: Any) -> dict[str, Any]:
-        """把配置的提示词作为系统消息追加到规划器上下文。"""
+        """把配置的触发提示词作为系统消息追加到规划器上下文。"""
 
         try:
             prompt = self.config.prompt.bot_prompt.strip()
@@ -232,25 +245,21 @@ class WeKnoraQaPlugin(MaiBotPlugin):
         return {"modified_kwargs": modified}
 
     # ---------------------------------------------------------------- #
-    # 问答流程
+    # 检索流程
     # ---------------------------------------------------------------- #
 
-    async def _ask(self, question: str, stream_id: str) -> str:
-        """执行一次问答：解析智能体与模型，取会话，发请求。"""
+    async def _retrieve(self, question: str) -> list[KnowledgeChunk]:
+        """执行一次检索：解析知识库、核对向量模型、拉回片段。"""
 
         client = self._client or self._build_client()
-        agent_id = await self._resolve_agent_id(client)
-        model_id, reasoning_effort = await self._resolve_model(client)
-        session_id = await self._ensure_session(client, stream_id)
-        options = AskOptions(
-            query=self._apply_agent_prompt(question),
-            agent_id=agent_id,
-            summary_model_id=model_id,
-            reasoning_effort=reasoning_effort,
-            web_search_enabled=True,
-            session_id=session_id,
+        knowledge_bases = self._select_knowledge_bases(await client.list_knowledge_bases())
+        await self._verify_embedding_model(client, knowledge_bases)
+        options = SearchOptions(
+            query=question,
+            knowledge_base_ids=[str(knowledge_base.get("id") or "") for knowledge_base in knowledge_bases],
+            match_count=self.config.retrieval.match_count,
         )
-        return await client.ask(options)
+        return await client.search(options)
 
     def _build_client(self) -> WeKnoraClient:
         service = self.config.service
@@ -260,115 +269,100 @@ class WeKnoraQaPlugin(MaiBotPlugin):
             timeout_seconds=float(service.timeout_seconds),
         )
 
-    async def _resolve_agent_id(self, client: WeKnoraClient) -> str:
-        """把配置里的智能体名称或 ID 解析成 WeKnora 的智能体 ID。"""
+    def _select_knowledge_bases(self, knowledge_bases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把配置里的知识库名称或 ID 解析成知识库对象；留空表示租户下全部知识库。"""
 
-        wanted = self.config.service.agent.strip()
-        cached = self._agent_ids.get(wanted)
-        if cached:
-            return cached
+        if not knowledge_bases:
+            raise WeKnoraError("WeKnora 中没有任何知识库")
+        wanted = self.config.retrieval.knowledge_base.strip()
+        if not wanted:
+            return knowledge_bases
 
-        agents = await client.list_agents()
-        resolved = ""
-        if wanted:
-            for agent in agents:
-                if str(agent.get("id") or "") == wanted:
-                    resolved = wanted
-                    break
-                if str(agent.get("name") or "").strip().lower() == wanted.lower():
-                    resolved = str(agent.get("id") or "")
-                    break
-            if not resolved:
-                names = "、".join(f"{agent.get('name')}({agent.get('id')})" for agent in agents)
-                raise WeKnoraError(f"WeKnora 中没有名为「{wanted}」的智能体，可用智能体：{names or '无'}")
-        else:
-            fallback = next((agent for agent in agents if agent.get("is_builtin")), None)
-            if fallback is None and agents:
-                fallback = agents[0]
-            if fallback is None:
-                raise WeKnoraError("WeKnora 中没有可用智能体")
-            resolved = str(fallback.get("id") or "")
-
-        self._agent_ids[wanted] = resolved
-        return resolved
-
-    async def _resolve_model(self, client: WeKnoraClient) -> tuple[str, str]:
-        """解析问答模型：配置指定优先，否则用 MaiBot planner 模型。返回 (模型 ID, 思考强度)。"""
-
-        configured = self.config.model.model.strip()
-        if configured:
-            cached = self._model_ids.get(configured)
-            if cached:
-                return cached
-            models = await client.list_models()
-            model = self._match_model(models, configured)
-            if model is None:
-                raise WeKnoraError(f"WeKnora 中没有名为「{configured}」的模型，可用模型：{describe_models(models)}")
-            resolved = (str(model.get("id") or ""), self._resolve_reasoning_effort(model))
-            self._model_ids[configured] = resolved
-            return resolved
-
-        # 跟随主程序 planner：主程序换了模型，这里下次提问就用新的。
-        models = await client.list_models()
-        planner = await asyncio.to_thread(resolve_planner_model)
-        model = self._match_model(models, planner.identifier)
-        if model is None:
-            raise WeKnoraError(
-                f"MaiBot planner 模型「{planner.name}」（{planner.identifier}）在 WeKnora 中不存在，"
-                f"可用模型：{describe_models(models)}"
+        target = wanted.lower()
+        selected = [
+            knowledge_base
+            for knowledge_base in knowledge_bases
+            if str(knowledge_base.get("id") or "") == wanted
+            or str(knowledge_base.get("name") or "").strip().lower() == target
+        ]
+        if not selected:
+            names = "、".join(
+                f"{knowledge_base.get('name')}({knowledge_base.get('id')})" for knowledge_base in knowledge_bases
             )
-        self.ctx.logger.info("使用 MaiBot planner 模型：%s（%s）", planner.name, planner.identifier)
-        return str(model.get("id") or ""), self._resolve_reasoning_effort(model)
+            raise WeKnoraError(f"WeKnora 中没有名为「{wanted}」的知识库，可用知识库：{names}")
+        return selected
+
+    async def _verify_embedding_model(
+        self, client: WeKnoraClient, knowledge_bases: list[dict[str, Any]]
+    ) -> None:
+        """核对知识库建库用的向量模型与 MaiBot embedding 任务配的是否同一个。"""
+
+        if self._embedding_checked:
+            return
+        self._embedding_checked = True
+        try:
+            maibot_model = await asyncio.to_thread(resolve_embedding_model)
+            models = await client.list_models()
+        except (EmbeddingModelError, WeKnoraError) as exc:
+            self.ctx.logger.warning("无法核对向量模型，本次跳过核对：%s", exc)
+            return
+
+        model_names = {str(model.get("id") or ""): str(model.get("name") or "") for model in models}
+        for knowledge_base in knowledge_bases:
+            weknora_name = model_names.get(str(knowledge_base.get("embedding_model_id") or ""), "")
+            if weknora_name and self._is_same_model(weknora_name, maibot_model):
+                self.ctx.logger.info("知识库「%s」向量模型与 MaiBot 一致：%s", knowledge_base.get("name"), weknora_name)
+            else:
+                self.ctx.logger.warning(
+                    "知识库「%s」建库用的向量模型是「%s」，与 MaiBot embedding 任务配置的「%s」（%s）不一致，"
+                    "召回质量可能受影响",
+                    knowledge_base.get("name"),
+                    weknora_name or "未知",
+                    maibot_model.name,
+                    maibot_model.identifier,
+                )
 
     @staticmethod
-    def _match_model(models: list[dict[str, Any]], wanted: str) -> dict[str, Any] | None:
-        """按 ID 或名称匹配模型，大小写不敏感。"""
+    def _is_same_model(weknora_name: str, maibot_model: EmbeddingModel) -> bool:
+        """WeKnora 的 Embedding 模型名与 MaiBot 的模型名或标识符是否指同一个模型。"""
 
-        target = wanted.strip().lower()
-        for model in models:
-            if str(model.get("id") or "").strip().lower() == target:
-                return model
-        for model in models:
-            if str(model.get("name") or "").strip().lower() == target:
-                return model
-        return None
+        target = weknora_name.strip().lower()
+        return target in (maibot_model.identifier.strip().lower(), maibot_model.name.strip().lower())
 
-    def _resolve_reasoning_effort(self, model: dict[str, Any]) -> str:
-        """按模型能力决定是否下发思考强度；模型不支持时不下发该参数。"""
+    def _format_chunks(self, question: str, chunks: list[KnowledgeChunk]) -> str:
+        """把片段拼成给规划器看的文本。"""
 
-        configured = self.config.model.reasoning_effort.strip() or "off"
-        capabilities = model.get("capabilities") or {}
-        levels = capabilities.get("thinking_levels") or []
-        if not levels:
-            return ""
-        if configured not in levels:
-            self.ctx.logger.warning(
-                "模型 %s 不支持思考强度「%s」（可选：%s），本次不下发该参数",
-                model.get("name"),
-                configured,
-                "、".join(str(level) for level in levels),
-            )
-            return ""
-        return configured
+        if not chunks:
+            return f"知识库中没有检索到与「{question}」相关的片段。"
+        limit = self.config.retrieval.max_chars_per_chunk
+        blocks = [self._format_chunk(index, chunk, limit) for index, chunk in enumerate(chunks, start=1)]
+        return (
+            f"以下是 WeKnora 知识库中与「{question}」最相关的 {len(chunks)} 条原文片段。\n"
+            "请只依据这些片段回答，片段里没有的信息如实说明资料未提及，不要编造。\n\n"
+            + "\n\n".join(blocks)
+        )
 
-    async def _ensure_session(self, client: WeKnoraClient, stream_id: str) -> str:
-        """按聊天流复用 WeKnora 会话；会话失效时重建。"""
+    @staticmethod
+    def _format_chunk(index: int, chunk: KnowledgeChunk, limit: int) -> str:
+        """拼出单条片段：来源、相关度与正文，超长正文按配置截断。"""
 
-        key = stream_id or _DEFAULT_SESSION_KEY
-        session_id = self._stream_sessions.get(key)
-        if session_id:
-            return session_id
-        session_id = await client.create_session()
-        self._stream_sessions[key] = session_id
-        return session_id
+        source = chunk.title or chunk.filename or "未知文档"
+        header = f"【片段 {index}】来源：{source} 第 {chunk.chunk_index} 段｜相关度 {chunk.score:.3f}"
+        content = chunk.content.strip()
+        if limit > 0 and len(content) > limit:
+            content = f"{content[:limit].rstrip()}\n…（片段过长已截断，原文共 {len(content)} 字）"
+        return f"{header}\n{content}"
 
-    def _apply_agent_prompt(self, question: str) -> str:
-        """把智能体提示词拼在问题前面。"""
+    @staticmethod
+    def _build_answer_prompt(question: str, fragments: str) -> str:
+        """把片段包成给 MaiBot planner 模型的作答提示。"""
 
-        prefix = self.config.prompt.agent_prompt.strip()
-        if not prefix:
-            return question
-        return f"{prefix}\n\n{question}"
+        return (
+            f"{fragments}\n\n"
+            f"用户问题：{question}\n"
+            "请用中文回答这个问题：直接给结论和关键数据，只依据上面的片段，"
+            "片段里没有的内容如实说明资料未提及，不要编造。"
+        )
 
     @staticmethod
     def _extract_query(kwargs: dict[str, Any]) -> str:
@@ -400,6 +394,6 @@ class WeKnoraQaPlugin(MaiBotPlugin):
 
 
 def create_plugin() -> WeKnoraQaPlugin:
-    """创建 WeKnora 问答插件实例。"""
+    """创建 WeKnora 检索插件实例。"""
 
     return WeKnoraQaPlugin()

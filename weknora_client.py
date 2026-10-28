@@ -1,16 +1,17 @@
-"""WeKnora 服务端问答客户端。
+"""WeKnora 知识库检索客户端。
 
-封装三件事：列智能体、列模型、发起问答。问答走 ``/api/v1/agent-chat/{session_id}``，
-WeKnora 以 SSE 分片返回，其中 ``response_type="answer"`` 的分片拼成最终答案。
+只做检索，不做问答：``POST /api/v1/knowledge-search`` 用知识库建库时绑定的向量模型
+把查询向量化，召回原文片段并 rerank 后原样返回，全程不经过任何 LLM 总结，答案由麦麦
+自己思考。另外提供列知识库、列模型两个只读接口，用于把配置里的知识库名称解析成 ID，
+以及核对 WeKnora 侧的向量模型和 MaiBot 配的是不是同一个。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any
 
 import httpx
-import json
 
 
 class WeKnoraError(RuntimeError):
@@ -18,15 +19,23 @@ class WeKnoraError(RuntimeError):
 
 
 @dataclass(slots=True)
-class AskOptions:
-    """单次问答参数。"""
+class KnowledgeChunk:
+    """一条检索命中的知识库片段。"""
+
+    content: str
+    title: str
+    filename: str
+    score: float
+    chunk_index: int
+
+
+@dataclass(slots=True)
+class SearchOptions:
+    """单次检索参数。"""
 
     query: str
-    agent_id: str = ""
-    summary_model_id: str = ""
-    reasoning_effort: str = ""
-    web_search_enabled: bool = True
-    session_id: str = ""
+    knowledge_base_ids: list[str]
+    match_count: int = 0
 
 
 class WeKnoraClient:
@@ -47,104 +56,74 @@ class WeKnoraClient:
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.get(f"{self._base_url}{path}", headers=self._headers())
         if response.status_code >= 400:
-            raise WeKnoraError(f"GET {path} 失败 HTTP {response.status_code}：{response.text[:300]}")
+            raise WeKnoraError(f"GET {path} 失败 HTTP {response.status_code}：{_describe_error(response)}")
         payload = response.json()
         data = payload.get("data")
         if not isinstance(data, list):
             raise WeKnoraError(f"GET {path} 返回结构异常：缺少 data 列表")
         return data
 
-    async def list_agents(self) -> list[dict[str, Any]]:
-        """列出当前租户可用的智能体。"""
+    async def list_knowledge_bases(self) -> list[dict[str, Any]]:
+        """列出当前租户可见的知识库。"""
 
-        return await self._get_list("/api/v1/agents")
+        return await self._get_list("/api/v1/knowledge-bases")
 
     async def list_models(self) -> list[dict[str, Any]]:
         """列出当前租户可用的模型。"""
 
         return await self._get_list("/api/v1/models")
 
-    async def create_session(self, title: str = "MaiBot 知识库问答") -> str:
-        """创建会话，返回会话 ID。"""
-
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.post(
-                f"{self._base_url}/api/v1/sessions",
-                headers=self._headers(),
-                json={"title": title},
-            )
-        if response.status_code >= 400:
-            raise WeKnoraError(f"创建会话失败 HTTP {response.status_code}：{response.text[:300]}")
-        session_id = str((response.json().get("data") or {}).get("id") or "")
-        if not session_id:
-            raise WeKnoraError("创建会话失败：响应缺少 data.id")
-        return session_id
-
-    async def ask(self, options: AskOptions) -> str:
-        """发起一次问答，返回智能体的完整回答。"""
+    async def search(self, options: SearchOptions) -> list[KnowledgeChunk]:
+        """检索知识库原文片段，WeKnora 不做 LLM 总结。"""
 
         body: dict[str, Any] = {
             "query": options.query,
-            "agent_enabled": True,
-            "agent_id": options.agent_id,
-            "summary_model_id": options.summary_model_id,
-            "reasoning_effort": options.reasoning_effort,
-            "web_search_enabled": options.web_search_enabled,
-            "channel": "api",
+            "knowledge_base_ids": options.knowledge_base_ids,
         }
-        url = f"{self._base_url}/api/v1/agent-chat/{options.session_id}"
-        answer_parts: list[str] = []
-        stream_error = ""
+        # match_count 为 0 时不下发，沿用租户检索配置里的默认条数。
+        if options.match_count > 0:
+            body["match_count"] = options.match_count
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            async with client.stream("POST", url, headers=self._headers(), json=body) as response:
-                if response.status_code >= 400:
-                    detail = (await response.aread()).decode("utf-8", "ignore")
-                    raise WeKnoraError(f"问答请求失败 HTTP {response.status_code}：{detail[:500]}")
-                async for event in _iter_sse_events(response):
-                    response_type = str(event.get("response_type") or "")
-                    content = event.get("content")
-                    if response_type == "answer" and isinstance(content, str):
-                        answer_parts.append(content)
-                    elif response_type == "error":
-                        stream_error = str(content or "WeKnora 返回未知错误")
+            response = await client.post(
+                f"{self._base_url}/api/v1/knowledge-search",
+                headers=self._headers(),
+                json=body,
+            )
+        if response.status_code >= 400:
+            raise WeKnoraError(f"知识库检索失败 HTTP {response.status_code}：{_describe_error(response)}")
 
-        if stream_error:
-            raise WeKnoraError(f"问答失败：{stream_error}")
-        answer = "".join(answer_parts).strip()
-        if not answer:
-            raise WeKnoraError("问答结束但没有拿到回答内容")
-        return answer
+        payload = response.json()
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise WeKnoraError("知识库检索返回结构异常：缺少 data 列表")
+        return [_parse_chunk(item) for item in data]
 
 
-async def _iter_sse_events(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
-    """把 SSE 响应拆成一个个事件字典。"""
+def _parse_chunk(item: Any) -> KnowledgeChunk:
+    """把一条检索结果转成片段对象。"""
 
-    data_lines: list[str] = []
-    async for raw_line in response.aiter_lines():
-        line = raw_line.strip()
-        if not line:
-            event = _parse_sse_payload(data_lines)
-            data_lines = []
-            if event is not None:
-                yield event
-            continue
-        if line.startswith("data:"):
-            data_lines.append(line[5:].strip())
-    event = _parse_sse_payload(data_lines)
-    if event is not None:
-        yield event
+    if not isinstance(item, dict):
+        raise WeKnoraError(f"知识库检索返回了非对象的结果项：{type(item).__name__}")
+    return KnowledgeChunk(
+        content=str(item.get("content") or ""),
+        title=str(item.get("knowledge_title") or ""),
+        filename=str(item.get("knowledge_filename") or ""),
+        score=float(item.get("score") or 0.0),
+        chunk_index=int(item.get("chunk_index") or 0),
+    )
 
 
-def _parse_sse_payload(data_lines: list[str]) -> dict[str, Any] | None:
-    """把一个事件的多行 data 解析成字典，解析失败返回 None。"""
+def _describe_error(response: httpx.Response) -> str:
+    """取出 WeKnora 错误响应里的 message，取不到就退回原始响应体。"""
 
-    if not data_lines:
-        return None
     try:
-        payload = json.loads("\n".join(data_lines))
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return payload
+        payload = response.json()
+    except ValueError:
+        return response.text[:300]
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        message = str(error.get("message") or "").strip()
+        if message:
+            return message
+    return str(payload)[:300]
