@@ -1,17 +1,19 @@
 {
   "manifest_version": 2,
+  "id": "github.gyyxjsj.weknora-qa",
   "version": "1.1.0",
   "name": "WeKnora 知识库检索",
   "description": "从自建 WeKnora 知识库拉回原文片段，交给麦麦自己思考：规划器可调用 weknora_search 工具，用户也可直接发 /提问",
   "author": {
-    "name": "local",
-    "url": "https://github.com/Tencent/WeKnora"
+    "name": "GYyxjsj",
+    "url": "https://github.com/GYyxjsj"
   },
   "license": "AGPL-3.0-or-later",
   "urls": {
-    "repository": "https://github.com/Tencent/WeKnora",
-    "homepage": "https://github.com/Tencent/WeKnora",
-    "issues": "https://github.com/Tencent/WeKnora/issues"
+    "repository": "https://github.com/GYyxjsj/weknora_qa_plugin",
+    "homepage": "https://github.com/GYyxjsj/weknora_qa_plugin",
+    "documentation": "https://github.com/GYyxjsj/weknora_qa_plugin/blob/main/README.md",
+    "issues": "https://github.com/GYyxjsj/weknora_qa_plugin/issues"
   },
   "changelog": "CHANGELOG.md",
   "host_application": {
@@ -23,12 +25,7 @@
     "max_version": "2.99.99"
   },
   "dependencies": [],
-  "display": {
-    "icon": {
-      "type": "lucide",
-      "value": "database"
-    }
-  },
+  "plugin_type": "data",
   "capabilities": [
     "send.text",
     "llm.generate"
@@ -39,5 +36,10 @@
       "zh-CN"
     ]
   },
-  "id": "local.weknora-qa-plugin"
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "database"
+    }
+  }
 }

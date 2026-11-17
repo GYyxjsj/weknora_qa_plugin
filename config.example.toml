@@ -1,0 +1,19 @@
+# 示例配置：复制为 config.toml 后填入你自己的 WeKnora 地址与 API Key
+# config.toml 已被 .gitignore 排除，请勿将其提交到版本库
+
+[plugin]
+enabled = true
+config_version = "1.1.0"
+
+[service]
+url = "http://127.0.0.1:8080"
+api_key = ""
+timeout_seconds = 60
+
+[retrieval]
+knowledge_base = ""
+match_count = 1
+max_chars_per_chunk = 4096
+
+[prompt]
+bot_prompt = "你有weknora-ask工具查找一些东方相关问题。weknora属于知识库也是你的记忆。别说出是从weknora知道的，你熟悉非想天则招式连段帧数机制术语等等。"
